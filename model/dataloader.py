@@ -20,13 +20,6 @@ def adjust_target_weight(joint, target_weight, tmp_size, sx=int(1280 / 4), sy=in
 
 
 def generate_sa_simdr(joints, joints_vis, sigma=8, sx=int(1280 / 4), sy=int(720 / 4), num_joints=13):
-    """
-    joints:  [num_joints, 3]
-    joints_vis: [num_joints, 3]
-
-    return => target, target_weight(1: visible, 0: invisible)
-    """
-
     target_weight = np.ones((num_joints, 1), dtype=np.float32)
     target_weight[:, 0] = joints_vis[:, 0]
 
@@ -79,9 +72,7 @@ def generate_label(u, v, mask, sigma=8, sx=int(1280 / 4), sy=int(720 / 4), num_j
 
 
 class DataGenerator(tf.keras.utils.Sequence):
-    # Define parameters
     def __init__(self, root_data_dir="", root_label_dir="", root_dict_dir="", size_w=1280, size_h=720, joints=13):
-        'Initialization'
         self.root_data_dir = root_data_dir
         self.root_label_dir = root_label_dir
         self.root_dict_dir = root_dict_dir
@@ -91,7 +82,6 @@ class DataGenerator(tf.keras.utils.Sequence):
         self.dict = np.load(root_dict_dir, allow_pickle=True)
 
     def __len__(self):
-        # Denotes the number of batches per epoch
         return len(self.dict)
 
     def __getitem__(self, index):
