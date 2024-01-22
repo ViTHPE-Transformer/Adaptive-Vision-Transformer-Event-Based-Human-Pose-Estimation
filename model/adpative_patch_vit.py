@@ -1,180 +1,240 @@
-import random
 import torch
-import logging
-import sys
-sys.path.append('../')
-# from new_dataloader import DataGenerator
-from dataloader import DataGenerator
-
-import torch.optim as optim
-from vit import HPEViT
-from adpative_patch_vit import ViTPose
-from torch.optim.lr_scheduler import LambdaLR
-from torchvision import transforms
-# from config.utils import create_logger, get_model_summary, get_optimizer
-import os
-import argparse
-from torch.utils.data import DataLoader
-import numpy as np
-from tools.utils import init_dir, IOStream, decode_batch_sa_simdr, accuracy, KLDiscretLoss
-from tools.geometry_function import get_pred_3d_batch, cal_2D_mpjpe, cal_3D_mpjpe
+from einops import rearrange, repeat
+from einops.layers.torch import Rearrange
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
 
 
-# 日志配置
-# logging.basicConfig(filename='/home/ynn/Event-Based_HPE/our_DHP19/ourmethod_pytorch/vit_training_log.log', level=logging.INFO, format='%(asctime)s:%(levelname)s:%(message)s')
-logging.basicConfig(filename='/mnt/DHP19_our/ourmethod_mt/vit_training_resize118_log.log', level=logging.INFO, format='%(asctime)s:%(levelname)s:%(message)s')
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
 
 
-def scheduler_func(epoch):
-    if epoch < 10:
-        return 0.01
-    elif epoch < 15:
-        return 0.001
-    else:
-        return 0.0001
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
-def train(args):
-    root_data_train = "/mnt/DHP19_our/train/"
-    root_data_test = "/mnt/DHP19_our/test/"
-    train_dataset = DataGenerator(root_data_dir=root_data_train + "data",
-                                  root_label_dir=root_data_train + "label",
-                                  root_dict_dir=root_data_train + "Frame_dict.npy",
-                                  size_h=args.sensor_sizeH,
-                                  size_w=args.sensor_sizeW,
-                                  joints=args.num_joints)
-    test_dataset = DataGenerator(root_data_dir=root_data_test + "data",
-                                 root_label_dir=root_data_test + "label",
-                                 root_dict_dir=root_data_test + "Frame_dict.npy",
-                                 size_h=args.sensor_sizeH,
-                                 size_w=args.sensor_sizeW,
-                                 joints=args.num_joints)
-    train_loader = DataLoader(train_dataset,
-                              num_workers=8,
-                              batch_size=args.train_batch_size,
-                              shuffle=True,
-                              drop_last=True)
-    test_loader = DataLoader(test_dataset,
-                             num_workers=8,
-                             batch_size=args.valid_batch_size,
-                             shuffle=False,
-                             drop_last=False)
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
 
-    model = HPEViT(
-        image_size=(180, 320),
-        patch_size=(9, 16),
-        num_joints=17,
-        dim=512,
-        depth=6,
-        heads=6,
-        mlp_dim=512,
-        dropout=0.1,
-        emb_dropout=0.1
-    )
-    # model = ViTPose(
-    #         image_height=720,
-    #         image_width=1280,
-    #         patch_size=(16, 16),
-    #         num_keypoints=17,
-    #         dim=768,
-    #         depth=1,
-    #         heads=16,
-    #         mlp_dim=1024,
-    #         dropout=0.1,
-    #         emb_dropout=0.1
-    # )
-    # model = nn.DataParallel(model)
-    device = torch.device("cuda:{}".format(args.cuda_num) if args.cuda else "cpu")
-    model.to(device)
+        self.heads = heads
+        self.scale = dim_head ** -0.5
 
-    criterion = KLDiscretLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=0.0005)
+        self.norm = nn.LayerNorm(dim)
 
-    scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: scheduler_func(epoch))
+        self.attend = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
 
-    num_epochs = args.epochs
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
 
-    min_loss = 1e6
-    for epoch in range(1, num_epochs + 1):
-        optimizer.step()
-        running_loss = 0.0
-        model.train()
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        ) if project_out else nn.Identity()
 
-        for i, (data, x, y, weight) in enumerate(train_loader, 0):
-            optimizer.zero_grad()
-            inputs = data.to(device)
-            x, y, weight = x.to(device), y.to(device), weight.to(device)
+    def forward(self, x):
+        x = self.norm(x)
 
-            outputs_x, outputs_y = model(inputs)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
 
-            loss = criterion(outputs_x, outputs_y, x, y, weight)
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-            running_loss += loss.item()
-            loss.backward()
-            scheduler.step()
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
 
-        torch.cuda.empty_cache()
-        train_loss_ave = running_loss / i
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
 
-        logging.info(f'Epoch {epoch}: Train Loss: {train_loss_ave}')
-        print("{} epoch train loss : {}".format(epoch, train_loss_ave))
 
-        if epoch % 1 == 0:
-            model.eval()
-            with torch.no_grad():
-                mpjpe_loss = 0
-                for i, (val_data, val_x, val_y, val_weight) in enumerate(test_loader, 0):
-                    val_inputs = val_data.to(device)
-                    val_x, val_y, val_weight = val_x.to(device), val_y.to(device), val_weight.to(device)
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout),  # 多头注意力部分
+                FeedForward(dim, mlp_dim, dropout=dropout)  # 前馈神经网络
+            ]))
 
-                    val_output_x, val_output_y = model(val_inputs)
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
 
-                    decode_batch_label = decode_batch_sa_simdr(val_x, val_y)
-                    decode_batch_pred = decode_batch_sa_simdr(val_output_x, val_output_y)
+        return self.norm(x)
 
-                    pred = np.zeros((args.valid_batch_size, 13, 2))
-                    pred[:, :, 1] = decode_batch_pred[:, :, 0]
-                    pred[:, :, 0] = decode_batch_pred[:, :, 1]
 
-                    batch_mpjpe_loss = cal_2D_mpjpe(decode_batch_label, val_weight.squeeze(dim=2).cpu(), decode_batch_pred)
+class ViTPose(nn.Module):
+    def __init__(self, *, image_height, image_width, patch_size, num_keypoints, dim, depth, heads, mlp_dim, pool='cls',
+                 channels=1, dim_head=64, dropout=0., emb_dropout=0.):
+        super().__init__()
+        patch_height, patch_width = patch_size[0], patch_size[1]
+        self.num_joints = num_keypoints
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
 
-                    mpjpe_loss += batch_mpjpe_loss
+        num_patches = (image_height // patch_height) * (image_width // patch_width)
+        patch_dim = channels * patch_height * patch_width
+        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-                mpjpe_loss_ave = mpjpe_loss / i
+        self.to_patch_embedding = nn.Sequential(
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
 
-                logging.info(f'Epoch {epoch}: Test mpjpe  Loss: {mpjpe_loss_ave}')
-                print("{} epoch mpjpe loss : {}".format(epoch, mpjpe_loss_ave))
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, dim))
+        self.dropout = nn.Dropout(emb_dropout)
 
-                if mpjpe_loss_ave < min_loss:
-                    min_loss = mpjpe_loss_ave
-                    torch.save({'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict()}, args.save_model + '/model_resize_p9_12h_d1_512_118.pth')
-                    print(f'Epoch {epoch}: New best model saved with loss: {min_loss}')
+        self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+        self.pool = pool
+        self.to_latent = nn.Identity()
+
+        self.linear1 = nn.Linear(dim, 1024, bias=False)
+        self.bn6 = nn.BatchNorm1d(1024)
+        self.dp1 = nn.Dropout(p=0.1)
+
+        self.linear2 = nn.Linear(1024, 512)
+        self.bn7 = nn.BatchNorm1d(512)
+
+        self.linear3 = nn.Linear(512, mlp_dim)
+        self.bn8 = nn.BatchNorm1d(mlp_dim)
+        self.dp2 = nn.Dropout(p=0.1)
+
+        self.mlp_head_x = nn.Linear(mlp_dim, self.num_joints * image_width)
+        self.mlp_head_y = nn.Linear(mlp_dim, self.num_joints * image_height)
+
+    def forward(self, img):
+        x = self.to_patch_embedding(img)
+        b, n, _ = x.shape
+
+        pos_embedding = self.pos_embedding[:, :n].expand(b, -1, -1)
+        x += pos_embedding
+
+        x = self.dropout(x)
+
+        clarity_values = self.calculate_clarity(x)
+
+        keep_percentage = 0.85
+        num_patches_to_keep = int(n * keep_percentage)
+        top_indices = clarity_values.argsort()[:, :num_patches_to_keep]
+        x = torch.stack([x[i, top_indices[i], :] for i in range(b)])
+
+        selected_pos_embedding = torch.stack([pos_embedding[i, top_indices[i], :] for i in range(b)])
+
+        x = self.to_latent(x)
+
+        x = x + selected_pos_embedding
+
+        x = self.transformer(x)
+
+        x = x.mean(dim=1) if self.pool == 'mean' else x[:, 0]  # torch.Size([2, 1024]), b=2
+
+        x = self.to_latent(x)
+
+        x = F.leaky_relu(self.bn6(self.linear1(x)), negative_slope=0.2)
+        x = self.dp1(x)
+        x = F.leaky_relu(self.bn7(self.linear2(x)), negative_slope=0.2)
+        x = self.linear3(x)
+        x = self.dp2(x)
+
+        batch_size = x.size(0)
+        preds_x = self.mlp_head_x(x)
+        preds_y = self.mlp_head_y(x)
+
+        preds_x = preds_x.view(batch_size, self.num_joints, 320)
+        preds_y = preds_y.view(batch_size, self.num_joints, 180)
+
+        return preds_x, preds_y
+
+    @staticmethod
+    def calculate_clarity(patches):
+        clarity = patches.var(dim=-1)
+        return clarity
+
+
+# JointsMSELoss as used in MMPose for 2D Human Pose Estimation
+class JointsMSELoss(nn.Module):
+    def __init__(self, use_target_weight=True):
+        """
+        Mean squared error loss for joints' heatmaps.
+
+        Parameters:
+            use_target_weight (bool): Use target weighting to mask out joints not in the dataset.
+        """
+        super(JointsMSELoss, self).__init__()
+        self.use_target_weight = use_target_weight
+
+    def forward(self, output, target, target_weight):
+        """
+        Forward pass for the loss calculation.
+
+        Parameters:
+            output (torch.Tensor): Predicted heatmaps.
+            target (torch.Tensor): Ground truth heatmaps.
+            target_weight (torch.Tensor): A tensor indicating the weight of each joint target.
+
+        Returns:
+            torch.Tensor: The computed mean squared error loss.
+        """
+        batch_size = output.size(0)
+        num_joints = output.size(1)
+        heatmaps_pred = output.reshape((batch_size, num_joints, -1)).split(1, 1)
+        heatmaps_gt = target.reshape((batch_size, num_joints, -1)).split(1, 1)
+        loss = 0
+
+        for idx in range(num_joints):
+            heatmap_pred = heatmaps_pred[idx].squeeze()
+            heatmap_gt = heatmaps_gt[idx].squeeze()
+            if self.use_target_weight:
+                loss += 0.5 * torch.mean(
+                    target_weight[:, idx] *
+                    (heatmap_pred - heatmap_gt) ** 2
+                )
+            else:
+                loss += 0.5 * torch.mean(
+                    (heatmap_pred - heatmap_gt) ** 2
+                )
+
+        return loss / num_joints
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='HPE VIT')
-    parser.add_argument('--train_batch_size', type=int, default=8, metavar='batch_size',
-                        help='Size of train batch)')
-    parser.add_argument('--valid_batch_size', type=int, default=8, metavar='batch_size',
-                        help='Size of valid batch)')
-    parser.add_argument('--epochs', type=int, default=20, metavar='N',
-                        help='number of episode to train ')
-    parser.add_argument('--no_cuda', type=bool, default=False,
-                        help='enables CUDA training')
-    parser.add_argument('--sensor_sizeH', type=int, default=720,
-                        help='sensor_sizeH')
-    parser.add_argument('--sensor_sizeW', type=int, default=1280,
-                        help='sensor_sizeW')
-    parser.add_argument('--num_joints', type=int, default=17,
-                        help='number of joints')
-    parser.add_argument('--save_model', type=str, default='/mnt/DHP19_our/ourmethod_mt/save_model',
-                        help='the path where the model is saved')
-    parser.add_argument('--cuda_num', type=int, default=0, metavar='N',
-                        help='cuda device number')
-    args = parser.parse_args()
+    v = ViTPose(
+        image_height=260,
+        image_width=344,
+        patch_size=(13, 8),
+        num_keypoints=17,
+        dim=1024,
+        depth=1,
+        heads=16,
+        mlp_dim=256,
+        dropout=0.1,
+        emb_dropout=0.1
+    )
 
-    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    img = torch.randn(2, 1, 260, 344)
+    img = torch.clamp(img, max=260)
+    print('img', img.shape)
 
-    train(args)
+    preds_x, preds_y = v(img)
+    print('preds', preds_x.shape)
 
-    print('******** Finish HPE VIT ********')
